@@ -83,6 +83,47 @@ String readUid() {
   return uid;
 }
 
+// Step 1: call the script (it runs now, Google answers with a redirect).
+// Step 2: follow the redirect on a fresh connection to read the reply.
+// ran = true means the script executed, even if the reply could not be read.
+String fetchWithRedirect(const String& url, int& finalCode, bool& ran) {
+  ran = false;
+  finalCode = 0;
+  String location;
+  {
+    WiFiClientSecure c1;
+    c1.setInsecure();
+    HTTPClient h1;
+    if (!h1.begin(c1, url)) return "";
+    const char* keys[] = {"Location"};
+    h1.collectHeaders(keys, 1);
+    h1.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    h1.setTimeout(15000);
+    int code = h1.GET();
+    finalCode = code;
+    if (code == 200) {
+      ran = true;
+      return h1.getString();
+    }
+    if (code == 301 || code == 302 || code == 303 || code == 307) {
+      ran = true;
+      location = h1.header("Location");
+    }
+    h1.end();
+  }                                   // first connection is freed here
+  if (location.length() == 0) return "";
+
+  WiFiClientSecure c2;
+  c2.setInsecure();
+  HTTPClient h2;
+  if (!h2.begin(c2, location)) return "";
+  h2.setTimeout(15000);
+  finalCode = h2.GET();
+  String body = (finalCode == 200) ? h2.getString() : "";
+  h2.end();
+  return body;
+}
+
 void sendScan(const String& uid) {
   connectWiFi();
   if (WiFi.status() != WL_CONNECTED) {
@@ -91,34 +132,26 @@ void sendScan(const String& uid) {
     return;
   }
 
-  WiFiClientSecure client;
-  client.setInsecure();                 // no certificate check; fine for a shop logger
-  client.setBufferSizes(1024, 512);
-
   String url = String(SCRIPT_URL) + "?uid=" + uid + "&dev=" + urlEncode(DEVICE_NAME);
   if (strlen(SECRET_KEY) > 0) url += "&key=" + urlEncode(SECRET_KEY);
 
-  HTTPClient http;
-  if (!http.begin(client, url)) {
-    Serial.println("http.begin failed");
-    beep(600, 3);
-    return;
-  }
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);  // Apps Script redirects once
-  http.setTimeout(10000);
-  int code = http.GET();
-  String payload = http.getString();
-  http.end();
+  Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
+  int code;
+  bool ran;
+  String payload = fetchWithRedirect(url, code, ran);
   payload.trim();
+  Serial.printf("HTTP %d, delivered=%d -> %s\n", code, ran, payload.c_str());
 
-  Serial.printf("HTTP %d -> %s\n", code, payload.c_str());
-
-  if (code == 200 && payload.startsWith("OK")) {
-    beep(150);                                               // logged / duplicate skipped
+  if (payload.startsWith("OK")) {
+    beep(150);                                          // logged
   } else if (payload.indexOf("CARD_UNKNOWN") >= 0 || payload.indexOf("CARD_INACTIVE") >= 0) {
-    beep(100, 2);                                            // card problem
+    beep(100, 2);                                       // card problem
+  } else if (payload.length() > 0) {
+    beep(600, 3);                                       // script returned some other error
+  } else if (ran) {
+    beep(150);                                          // reached Google, reply not read
   } else {
-    beep(600, 3);                                            // error
+    beep(600, 3);                                       // never reached Google
   }
 }
 
