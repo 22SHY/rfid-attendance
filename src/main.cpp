@@ -1,25 +1,36 @@
 /*
-  ESP8266 + MFRC522 RFID attendance -> Google Sheets (Apps Script)
+  ESP8266 + MFRC522 RFID attendance -> Google Sheets (Apps Script), with DS3231 clock
 
-  Wiring (NodeMCU -> MFRC522): D2=SDA, D5=SCK, D7=MOSI, D6=MISO, D1=RST, 3V3, GND
-  Buzzer: D0 -> buzzer (+), GND -> buzzer (-)
+  Wiring (NodeMCU):
+    MFRC522 : D2=SDA, D5=SCK, D7=MOSI, D6=MISO, D1=RST, 3V3, GND
+    DS3231  : D3=SDA, D4=SCL, 3V3, GND      (NOT 5V)
+    Buzzer  : D0 -> buzzer (+), GND -> buzzer (-)
 
   Beeps:  1 short  = logged (or duplicate skipped)
           2 quick  = card unknown / inactive
           3 long   = WiFi or server error
+
+  Every scan is sent with the clock's time (&ts=). If the clock is not set or
+  lost power, the ts is left out and Google uses its own time instead.
+
+  Serial Monitor command to set the clock (local shop time):
+    set 2026-10-10 15:20:00
 */
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ESP8266HTTPClient.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <MFRC522.h>
 #include "config.h"
 
 #define SS_PIN   D2
 #define RST_PIN  D1
 #define BUZZER   D0
-#define LED      LED_BUILTIN   // active LOW on NodeMCU
+#define SDA_PIN  D3
+#define SCL_PIN  D4     // note: this is also the onboard LED pin, so the LED is not used
+#define DS3231_ADDR 0x68
 
 const unsigned long SAME_CARD_DELAY_MS = 3000;  // ignore the same card tapped again within 3 s
 
@@ -27,17 +38,93 @@ MFRC522 rfid(SS_PIN, RST_PIN);
 String lastUid = "";
 unsigned long lastScanMs = 0;
 
+// ---------------------------------------------------------------- buzzer
 void beep(int onMs, int times = 1) {
   for (int i = 0; i < times; i++) {
     digitalWrite(BUZZER, HIGH);
-    digitalWrite(LED, LOW);
     delay(onMs);
     digitalWrite(BUZZER, LOW);
-    digitalWrite(LED, HIGH);
     if (i < times - 1) delay(100);
   }
 }
 
+// ---------------------------------------------------------------- DS3231 clock
+static uint8_t bcd2dec(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+static uint8_t dec2bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
+
+bool readTime(int &y, int &mo, int &d, int &h, int &mi, int &s) {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) return false;
+  if (Wire.requestFrom(DS3231_ADDR, 7) != 7) return false;
+  s  = bcd2dec(Wire.read() & 0x7F);
+  mi = bcd2dec(Wire.read() & 0x7F);
+  h  = bcd2dec(Wire.read() & 0x3F);   // 24-hour mode
+  Wire.read();                        // day of week (unused)
+  d  = bcd2dec(Wire.read() & 0x3F);
+  mo = bcd2dec(Wire.read() & 0x1F);
+  y  = 2000 + bcd2dec(Wire.read());
+  return true;
+}
+
+// Oscillator Stop Flag: 1 = clock lost power / never set
+bool timeNotTrusted() {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x0F);
+  if (Wire.endTransmission() != 0) return true;
+  if (Wire.requestFrom(DS3231_ADDR, 1) != 1) return true;
+  return (Wire.read() & 0x80) != 0;
+}
+
+bool setTime(int y, int mo, int d, int h, int mi, int s) {
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x00);
+  Wire.write(dec2bcd(s));
+  Wire.write(dec2bcd(mi));
+  Wire.write(dec2bcd(h));
+  Wire.write(1);                      // day of week, not used
+  Wire.write(dec2bcd(d));
+  Wire.write(dec2bcd(mo));
+  Wire.write(dec2bcd(y - 2000));
+  if (Wire.endTransmission() != 0) return false;
+
+  Wire.beginTransmission(DS3231_ADDR);   // clear Oscillator Stop Flag
+  Wire.write(0x0F);
+  Wire.endTransmission();
+  Wire.requestFrom(DS3231_ADDR, 1);
+  uint8_t st = Wire.read();
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(0x0F);
+  Wire.write(st & 0x7F);
+  return Wire.endTransmission() == 0;
+}
+
+// Returns "YYYY-MM-DD HH:MM:SS", or "" if the clock cannot be trusted
+String clockTimestamp() {
+  int y, mo, d, h, mi, s;
+  if (!readTime(y, mo, d, h, mi, s)) return "";
+  if (timeNotTrusted() || y < 2024) return "";
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, mi, s);
+  return String(buf);
+}
+
+void handleSerialCommands() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+  int y, mo, d, h, mi, s;
+  if (line.startsWith("set ") &&
+      sscanf(line.c_str() + 4, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
+    Serial.println(setTime(y, mo, d, h, mi, s) ? "Clock set." : "Set FAILED (I2C error)");
+    Serial.println("Clock now: " + clockTimestamp());
+  } else {
+    Serial.println("Unknown command. Use:  set YYYY-MM-DD HH:MM:SS");
+  }
+}
+
+// ---------------------------------------------------------------- WiFi
 void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
   Serial.print("Connecting to WiFi");
@@ -124,7 +211,7 @@ String fetchWithRedirect(const String& url, int& finalCode, bool& ran) {
   return body;
 }
 
-void sendScan(const String& uid) {
+void sendScan(const String& uid, const String& ts) {
   connectWiFi();
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("No WiFi");
@@ -133,6 +220,7 @@ void sendScan(const String& uid) {
   }
 
   String url = String(SCRIPT_URL) + "?uid=" + uid + "&dev=" + urlEncode(DEVICE_NAME);
+  if (ts.length() > 0) url += "&ts=" + urlEncode(ts);
   if (strlen(SECRET_KEY) > 0) url += "&key=" + urlEncode(SECRET_KEY);
 
   Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
@@ -155,21 +243,27 @@ void sendScan(const String& uid) {
   }
 }
 
+// ---------------------------------------------------------------- main
 void setup() {
   Serial.begin(115200);
   pinMode(BUZZER, OUTPUT);
-  pinMode(LED, OUTPUT);
   digitalWrite(BUZZER, LOW);
-  digitalWrite(LED, HIGH);
 
+  Wire.begin(SDA_PIN, SCL_PIN);
   SPI.begin();
   rfid.PCD_Init();
+
+  String now = clockTimestamp();
+  if (now.length() > 0) Serial.println("Clock: " + now);
+  else Serial.println("Clock NOT SET or not found - set it with:  set YYYY-MM-DD HH:MM:SS");
+
   connectWiFi();
   beep(100, 2);
   Serial.println("Ready. Tap a card.");
 }
 
 void loop() {
+  handleSerialCommands();
   if (WiFi.status() != WL_CONNECTED) connectWiFi();
 
   if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
@@ -182,6 +276,7 @@ void loop() {
   lastUid = uid;
   lastScanMs = millis();
 
-  Serial.println("Card: " + uid);
-  sendScan(uid);
+  String ts = clockTimestamp();            // time of the tap, taken right now
+  Serial.println("Card: " + uid + "  time: " + (ts.length() ? ts : String("(no clock)")));
+  sendScan(uid, ts);
 }
