@@ -1,20 +1,29 @@
 /*
-  ESP8266 + MFRC522 RFID attendance -> Google Sheets (Apps Script), with DS3231 clock
+  ESP8266 + MFRC522 RFID attendance -> Google Sheets (Apps Script)
+  with DS3231 clock and an offline queue (saved on the board, uploaded later)
 
   Wiring (NodeMCU):
     MFRC522 : D2=SDA, D5=SCK, D7=MOSI, D6=MISO, D1=RST, 3V3, GND
     DS3231  : D3=SDA, D4=SCL, 3V3, GND      (NOT 5V)
     Buzzer  : D0 -> buzzer (+), GND -> buzzer (-)
 
-  Beeps:  1 short  = logged (or duplicate skipped)
-          2 quick  = card unknown / inactive
-          3 long   = WiFi or server error
+  How a tap is handled (outbox pattern):
+    1. Take the time from the DS3231.
+    2. Save "UID,time" at the END of the queue file (survives power cuts).
+    3. If WiFi is up, upload the queue oldest-first (up to 3 records now).
+    4. Anything not confirmed stays in the queue; a background job retries it.
+    The Apps Script ignores a record it already has (same UID + time), so a
+    retry after a lost reply can never create a duplicate row.
 
-  Every scan is sent with the clock's time (&ts=). If the clock is not set or
-  lost power, the ts is left out and Google uses its own time instead.
+  Beeps:  1 short (150 ms)  = logged
+          2 quick           = card unknown / inactive
+          1 long (500 ms)   = saved on the board, will upload when online
+          3 long            = error (scan could NOT be saved)
 
-  Serial Monitor command to set the clock (local shop time):
-    set 2026-10-10 15:20:00
+  Serial Monitor commands:
+    set 2026-10-10 15:20:00     set the clock (local shop time)
+    queue                       show how many scans are waiting
+    clearqueue                  delete waiting scans (testing only!)
 */
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -22,6 +31,7 @@
 #include <ESP8266HTTPClient.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <LittleFS.h>
 #include <MFRC522.h>
 #include "config.h"
 
@@ -29,14 +39,21 @@
 #define RST_PIN  D1
 #define BUZZER   D0
 #define SDA_PIN  D3
-#define SCL_PIN  D4     // note: this is also the onboard LED pin, so the LED is not used
+#define SCL_PIN  D4     // also the onboard LED pin, so the LED is not used
 #define DS3231_ADDR 0x68
 
 const unsigned long SAME_CARD_DELAY_MS = 3000;  // ignore the same card tapped again within 3 s
+const char* QUEUE_FILE = "/queue.txt";
+const char* QUEUE_TMP  = "/queue.tmp";
+const int   MAX_QUEUE = 500;          // max waiting scans (about 16 KB)
+const int   MAX_VERIFY_TRIES = 5;     // reached Google but reply unreadable this many times -> stop retrying
 
 MFRC522 rfid(SS_PIN, RST_PIN);
 String lastUid = "";
 unsigned long lastScanMs = 0;
+bool fsOk = false;
+int headTries = 0;
+unsigned long lastNetFailMs = 0;      // when Google was last unreachable (0 = fine)
 
 // ---------------------------------------------------------------- buzzer
 void beep(int onMs, int times = 1) {
@@ -109,23 +126,8 @@ String clockTimestamp() {
   return String(buf);
 }
 
-void handleSerialCommands() {
-  if (!Serial.available()) return;
-  String line = Serial.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) return;
-  int y, mo, d, h, mi, s;
-  if (line.startsWith("set ") &&
-      sscanf(line.c_str() + 4, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
-    Serial.println(setTime(y, mo, d, h, mi, s) ? "Clock set." : "Set FAILED (I2C error)");
-    Serial.println("Clock now: " + clockTimestamp());
-  } else {
-    Serial.println("Unknown command. Use:  set YYYY-MM-DD HH:MM:SS");
-  }
-}
-
 // ---------------------------------------------------------------- WiFi
-void connectWiFi() {
+void connectWiFi() {            // blocking, used once at startup
   if (WiFi.status() == WL_CONNECTED) return;
   Serial.print("Connecting to WiFi");
   WiFi.mode(WIFI_STA);
@@ -139,8 +141,18 @@ void connectWiFi() {
     Serial.print("\nConnected, IP: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("\nWiFi failed");
+    Serial.println("\nWiFi failed (scans will be saved and uploaded later)");
   }
+}
+
+// Non-blocking: taps keep working while WiFi is down
+void keepWiFiAlive() {
+  static unsigned long lastTry = 0;
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - lastTry < 20000) return;
+  lastTry = millis();
+  Serial.println("WiFi down - trying to reconnect");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
 }
 
 // Make text safe to put inside a URL (spaces -> %20 etc.)
@@ -170,6 +182,7 @@ String readUid() {
   return uid;
 }
 
+// ---------------------------------------------------------------- Google call
 // Step 1: call the script (it runs now, Google answers with a redirect).
 // Step 2: follow the redirect on a fresh connection to read the reply.
 // ran = true means the script executed, even if the reply could not be read.
@@ -211,25 +224,18 @@ String fetchWithRedirect(const String& url, int& finalCode, bool& ran) {
   return body;
 }
 
-void sendScan(const String& uid, const String& ts) {
-  connectWiFi();
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("No WiFi");
-    beep(600, 3);
-    return;
-  }
-
+String sendRecord(const String& uid, const String& ts, int& code, bool& ran) {
   String url = String(SCRIPT_URL) + "?uid=" + uid + "&dev=" + urlEncode(DEVICE_NAME);
   if (ts.length() > 0) url += "&ts=" + urlEncode(ts);
   if (strlen(SECRET_KEY) > 0) url += "&key=" + urlEncode(SECRET_KEY);
-
   Serial.printf("Free heap: %u\n", ESP.getFreeHeap());
-  int code;
-  bool ran;
   String payload = fetchWithRedirect(url, code, ran);
   payload.trim();
   Serial.printf("HTTP %d, delivered=%d -> %s\n", code, ran, payload.c_str());
+  return payload;
+}
 
+void beepForReply(const String& payload, bool ran) {
   if (payload.startsWith("OK")) {
     beep(150);                                          // logged
   } else if (payload.indexOf("CARD_UNKNOWN") >= 0 || payload.indexOf("CARD_INACTIVE") >= 0) {
@@ -243,6 +249,179 @@ void sendScan(const String& uid, const String& ts) {
   }
 }
 
+// ---------------------------------------------------------------- queue (LittleFS)
+bool popQueue();
+
+int queueCount() {
+  if (!fsOk || !LittleFS.exists(QUEUE_FILE)) return 0;
+  File f = LittleFS.open(QUEUE_FILE, "r");
+  if (!f) return 0;
+  int n = 0;
+  while (f.available()) {
+    if (f.read() == '\n') n++;
+  }
+  f.close();
+  return n;
+}
+
+bool enqueue(const String& uid, const String& ts) {
+  if (!fsOk) return false;
+  if (queueCount() >= MAX_QUEUE) return false;
+  File f = LittleFS.open(QUEUE_FILE, "a");
+  if (!f) return false;
+  size_t w = f.print(uid + "," + ts + "\n");
+  f.close();
+  return w > 0;
+}
+
+// Reads the OLDEST waiting scan. Returns false if the queue is empty.
+bool peekQueue(String& uid, String& ts) {
+  if (!fsOk || !LittleFS.exists(QUEUE_FILE)) return false;
+  File f = LittleFS.open(QUEUE_FILE, "r");
+  if (!f) return false;
+  String line = f.readStringUntil('\n');
+  f.close();
+  line.trim();
+  int comma = line.indexOf(',');
+  if (comma < 1) {                    // damaged line: drop it and look at the next one
+    Serial.println("Dropping damaged queue line");
+    popQueue();
+    return peekQueue(uid, ts);
+  }
+  uid = line.substring(0, comma);
+  ts  = line.substring(comma + 1);
+  return true;
+}
+
+// Removes the OLDEST scan. Writes a temp file first so a power cut cannot lose the rest.
+bool popQueue() {
+  if (!fsOk || !LittleFS.exists(QUEUE_FILE)) return false;
+  File f = LittleFS.open(QUEUE_FILE, "r");
+  if (!f) return false;
+  String all = f.readString();
+  f.close();
+  int nl = all.indexOf('\n');
+  String rest = (nl < 0) ? "" : all.substring(nl + 1);
+  if (rest.length() == 0) return LittleFS.remove(QUEUE_FILE);
+  File t = LittleFS.open(QUEUE_TMP, "w");
+  if (!t) return false;
+  t.print(rest);
+  t.close();
+  LittleFS.remove(QUEUE_FILE);
+  return LittleFS.rename(QUEUE_TMP, QUEUE_FILE);
+}
+
+// Replies after which the scan is finished and can leave the queue
+bool isFinalReply(const String& r) {
+  return r.startsWith("OK") ||
+         r.indexOf("CARD_UNKNOWN") >= 0 || r.indexOf("CARD_INACTIVE") >= 0 ||
+         r.indexOf("BAD_TIMESTAMP") >= 0 || r.indexOf("MISSING_UID") >= 0;
+}
+
+bool netRecentlyFailed() {
+  return lastNetFailMs != 0 && millis() - lastNetFailMs < 60000;
+}
+
+// Uploads waiting scans oldest-first. Returns how many left the queue.
+int flushQueue(int maxRecords, String& lastReply, bool& lastRan) {
+  int removed = 0;
+  for (int n = 0; n < maxRecords; n++) {
+    String uid, ts;
+    if (!peekQueue(uid, ts)) break;                     // queue empty
+    int code;
+    bool ran;
+    String reply = sendRecord(uid, ts, code, ran);
+    lastReply = reply;
+    lastRan = ran;
+    lastNetFailMs = ran ? 0 : millis();
+
+    bool done = isFinalReply(reply);
+    if (!done && reply.length() == 0 && ran) {          // reached Google, reply unreadable
+      if (++headTries >= MAX_VERIFY_TRIES) {
+        Serial.println("Reply never readable; scan did reach Google - removing from queue");
+        done = true;
+      }
+    }
+    if (!done) break;                                   // keep it and retry later
+    popQueue();
+    headTries = 0;
+    removed++;
+  }
+  return removed;
+}
+
+// Called from loop(): slowly empties the queue when nothing else is going on
+void backgroundFlush() {
+  static unsigned long lastTry = 0;
+  static unsigned long interval = 5000;
+  if (millis() - lastTry < interval) return;
+  lastTry = millis();
+  if (WiFi.status() != WL_CONNECTED || !fsOk) { interval = 5000; return; }
+  if (millis() - lastScanMs < 5000) { interval = 2000; return; }   // just after a tap
+  if (queueCount() == 0) { interval = 5000; return; }
+  String reply;
+  bool ran = false;
+  int sent = flushQueue(1, reply, ran);
+  interval = (sent > 0) ? 500 : 30000;
+}
+
+// ---------------------------------------------------------------- a card tap
+void handleTap(const String& uid) {
+  String ts = clockTimestamp();
+  Serial.println("Card: " + uid + "  time: " + (ts.length() ? ts : String("(no clock)")));
+
+  // No trusted clock or no storage: a scan cannot be saved for later
+  if (ts.length() == 0 || !fsOk) {
+    if (WiFi.status() == WL_CONNECTED) {
+      int code;
+      bool ran;
+      String reply = sendRecord(uid, ts, code, ran);
+      beepForReply(reply, ran);
+    } else {
+      Serial.println("No WiFi and cannot save: scan LOST");
+      beep(600, 3);
+    }
+    return;
+  }
+
+  if (!enqueue(uid, ts)) {
+    Serial.println("Cannot save scan (storage full?)");
+    beep(600, 3);
+    return;
+  }
+  Serial.printf("Saved. %d waiting\n", queueCount());
+
+  String reply = "";
+  bool ran = false;
+  if (WiFi.status() == WL_CONNECTED && !netRecentlyFailed()) flushQueue(3, reply, ran);
+
+  if (queueCount() == 0) beepForReply(reply, ran);      // this tap was handled
+  else beep(500, 1);                                    // saved, uploads when online
+}
+
+void handleSerialCommands() {
+  if (!Serial.available()) return;
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+  if (line.length() == 0) return;
+  int y, mo, d, h, mi, s;
+  if (line.startsWith("set ") &&
+      sscanf(line.c_str() + 4, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &s) == 6) {
+    Serial.println(setTime(y, mo, d, h, mi, s) ? "Clock set." : "Set FAILED (I2C error)");
+    Serial.println("Clock now: " + clockTimestamp());
+  } else if (line == "queue") {
+    Serial.printf("Queue: %d waiting\n", queueCount());
+  } else if (line == "clearqueue") {
+    if (fsOk) {
+      LittleFS.remove(QUEUE_FILE);
+      LittleFS.remove(QUEUE_TMP);
+    }
+    Serial.println("Queue cleared.");
+  } else {
+    Serial.println("Commands:  set YYYY-MM-DD HH:MM:SS  |  queue  |  clearqueue");
+  }
+}
+
 // ---------------------------------------------------------------- main
 void setup() {
   Serial.begin(115200);
@@ -252,6 +431,14 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN);
   SPI.begin();
   rfid.PCD_Init();
+
+  fsOk = LittleFS.begin();
+  if (!fsOk) {
+    Serial.println("LittleFS failed - offline saving disabled");
+  } else if (!LittleFS.exists(QUEUE_FILE) && LittleFS.exists(QUEUE_TMP)) {
+    LittleFS.rename(QUEUE_TMP, QUEUE_FILE);             // recover from a power cut mid-update
+  }
+  Serial.printf("Queue: %d waiting\n", queueCount());
 
   String now = clockTimestamp();
   if (now.length() > 0) Serial.println("Clock: " + now);
@@ -264,7 +451,8 @@ void setup() {
 
 void loop() {
   handleSerialCommands();
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  keepWiFiAlive();
+  backgroundFlush();
 
   if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
 
@@ -276,7 +464,5 @@ void loop() {
   lastUid = uid;
   lastScanMs = millis();
 
-  String ts = clockTimestamp();            // time of the tap, taken right now
-  Serial.println("Card: " + uid + "  time: " + (ts.length() ? ts : String("(no clock)")));
-  sendScan(uid, ts);
+  handleTap(uid);
 }
