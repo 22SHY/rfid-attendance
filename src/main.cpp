@@ -5,7 +5,8 @@
   Wiring (NodeMCU):
     MFRC522 : D2=SDA, D5=SCK, D7=MOSI, D6=MISO, D1=RST, 3V3, GND
     DS3231  : D3=SDA, D4=SCL, 3V3, GND      (NOT 5V)
-    Buzzer  : D0 -> buzzer (+), GND -> buzzer (-)
+    Green LED: D0 -> 330 ohm resistor -> LED long leg (+); LED short leg (-) -> GND
+    Red LED  : D8 -> 330 ohm resistor -> LED long leg (+); LED short leg (-) -> GND
 
   How a tap is handled (outbox pattern):
     1. Take the time from the DS3231.
@@ -15,10 +16,13 @@
     The Apps Script ignores a record it already has (same UID + time), so a
     retry after a lost reply can never create a duplicate row.
 
-  Beeps:  1 short (150 ms)  = logged
-          2 quick           = card unknown / inactive
-          1 long (500 ms)   = saved on the board, will upload when online
-          3 long            = error (scan could NOT be saved)
+  LED signals (no buzzer in this version):
+    Power on / WiFi connected   = light show: green, red, then both
+    Idle (ready to tap)         = RED stays on, steady
+    Card accepted (in or out)   = GREEN on for 5 seconds, red off
+    Card unknown / inactive     = red blinks 3 times
+    No WiFi (saved on board)    = green and red blink alternately
+    Error (scan not saved)      = green and red both on, long light
 
   Serial Monitor commands:
     set 2026-10-10 15:20:00     set the clock (local shop time)
@@ -37,7 +41,10 @@
 
 #define SS_PIN   D2
 #define RST_PIN  D1
-#define BUZZER   D0
+#define LED_GREEN D0
+#define LED_RED   D8     // D8 must stay LOW at boot: the LED + resistor to GND does that
+#define GREEN_HOLD_MS 5000   // how long green stays on after an accepted card
+#define ERROR_HOLD_MS 3000   // how long both LEDs stay on for an error
 #define SDA_PIN  D3
 #define SCL_PIN  D4     // also the onboard LED pin, so the LED is not used
 #define DS3231_ADDR 0x68
@@ -55,14 +62,60 @@ bool fsOk = false;
 int headTries = 0;
 unsigned long lastNetFailMs = 0;      // when Google was last unreachable (0 = fine)
 
-// ---------------------------------------------------------------- buzzer
-void beep(int onMs, int times = 1) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(BUZZER, HIGH);
-    delay(onMs);
-    digitalWrite(BUZZER, LOW);
-    if (i < times - 1) delay(100);
+// ---------------------------------------------------------------- LEDs
+enum Signal { SIG_OK, SIG_CARD_PROBLEM, SIG_SAVED, SIG_ERROR };
+
+unsigned long successUntilMs = 0;     // green stays on until this time (0 = not holding)
+bool wifiWasUp = false;
+
+void setLeds(bool green, bool red) {
+  digitalWrite(LED_GREEN, green ? HIGH : LOW);
+  digitalWrite(LED_RED, red ? HIGH : LOW);
+}
+
+// Light show: green, red, then both
+void ledSelfTest() {
+  setLeds(true, false);  delay(250);
+  setLeds(false, true);  delay(250);
+  setLeds(true, true);   delay(250);
+  setLeds(false, false);
+}
+
+// Result of a tap. Idle is "red steady"; every signal ends back in that state.
+void showSignal(Signal sig) {
+  successUntilMs = 0;                                   // a new result cancels any green hold
+  switch (sig) {
+    case SIG_OK:                                        // accepted: green for 5 s, red off (not blocking)
+      successUntilMs = millis() + GREEN_HOLD_MS;
+      setLeds(true, false);
+      return;
+    case SIG_CARD_PROBLEM:                              // red blinks 3 times
+      for (int i = 0; i < 3; i++) {
+        setLeds(false, false); delay(300);
+        setLeds(false, true);  delay(300);
+      }
+      break;
+    case SIG_SAVED:                                     // no WiFi: green and red blink alternately
+      for (int i = 0; i < 3; i++) {
+        setLeds(true, false);  delay(300);
+        setLeds(false, true);  delay(300);
+      }
+      break;
+    case SIG_ERROR:                                     // error: both on, long light
+      setLeds(true, true);
+      delay(ERROR_HOLD_MS);
+      break;
   }
+  setLeds(false, true);                                 // back to idle: red steady
+}
+
+// Called every pass of loop(): keeps the idle / green-hold state and repeats the light show when WiFi comes back
+void ledTick() {
+  bool up = (WiFi.status() == WL_CONNECTED);
+  if (up && !wifiWasUp) ledSelfTest();                  // WiFi just connected
+  wifiWasUp = up;
+  if (millis() < successUntilMs) setLeds(true, false);  // holding green
+  else setLeds(false, true);                            // idle: red steady
 }
 
 // ---------------------------------------------------------------- DS3231 clock
@@ -235,17 +288,17 @@ String sendRecord(const String& uid, const String& ts, int& code, bool& ran) {
   return payload;
 }
 
-void beepForReply(const String& payload, bool ran) {
+void signalForReply(const String& payload, bool ran) {
   if (payload.startsWith("OK")) {
-    beep(150);                                          // logged
+    showSignal(SIG_OK);                                 // CHECK-IN, CHECK-OUT or an already-logged duplicate
   } else if (payload.indexOf("CARD_UNKNOWN") >= 0 || payload.indexOf("CARD_INACTIVE") >= 0) {
-    beep(100, 2);                                       // card problem
+    showSignal(SIG_CARD_PROBLEM);
   } else if (payload.length() > 0) {
-    beep(600, 3);                                       // script returned some other error
+    showSignal(SIG_ERROR);                              // script returned some other error
   } else if (ran) {
-    beep(150);                                          // reached Google, reply not read
+    showSignal(SIG_OK);                                 // reached Google, reply not read (no-clock path only)
   } else {
-    beep(600, 3);                                       // never reached Google
+    showSignal(SIG_ERROR);                              // never reached Google
   }
 }
 
@@ -376,17 +429,17 @@ void handleTap(const String& uid) {
       int code;
       bool ran;
       String reply = sendRecord(uid, ts, code, ran);
-      beepForReply(reply, ran);
+      signalForReply(reply, ran);
     } else {
       Serial.println("No WiFi and cannot save: scan LOST");
-      beep(600, 3);
+      showSignal(SIG_ERROR);
     }
     return;
   }
 
   if (!enqueue(uid, ts)) {
     Serial.println("Cannot save scan (storage full?)");
-    beep(600, 3);
+    showSignal(SIG_ERROR);
     return;
   }
   Serial.printf("Saved. %d waiting\n", queueCount());
@@ -395,8 +448,8 @@ void handleTap(const String& uid) {
   bool ran = false;
   if (WiFi.status() == WL_CONNECTED && !netRecentlyFailed()) flushQueue(3, reply, ran);
 
-  if (queueCount() == 0) beepForReply(reply, ran);      // this tap was handled
-  else beep(500, 1);                                    // saved, uploads when online
+  if (queueCount() == 0) signalForReply(reply, ran);    // this tap was handled
+  else showSignal(SIG_SAVED);                               // saved, uploads when online
 }
 
 void handleSerialCommands() {
@@ -425,8 +478,11 @@ void handleSerialCommands() {
 // ---------------------------------------------------------------- main
 void setup() {
   Serial.begin(115200);
-  pinMode(BUZZER, OUTPUT);
-  digitalWrite(BUZZER, LOW);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, LOW);
+  ledSelfTest();
 
   Wire.begin(SDA_PIN, SCL_PIN);
   SPI.begin();
@@ -445,7 +501,9 @@ void setup() {
   else Serial.println("Clock NOT SET or not found - set it with:  set YYYY-MM-DD HH:MM:SS");
 
   connectWiFi();
-  beep(100, 2);
+  wifiWasUp = (WiFi.status() == WL_CONNECTED);
+  if (wifiWasUp) ledSelfTest();                         // same light show once WiFi is connected
+  setLeds(false, true);                                 // idle: red steady
   Serial.println("Ready. Tap a card.");
 }
 
@@ -453,6 +511,7 @@ void loop() {
   handleSerialCommands();
   keepWiFiAlive();
   backgroundFlush();
+  ledTick();
 
   if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
 
